@@ -1,7 +1,8 @@
 import cv2 as cv
 import numpy as np
-from PyQt5.QtCore import QCoreApplication, QObject, Qt, QThread, pyqtSignal
-from PyQt5.QtWidgets import QApplication
+from PyQt6.QtCore import QCoreApplication, QObject, Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QFontDatabase
+from PyQt6.QtWidgets import QApplication
 import sys
 from threading import Thread
 from typing import Optional
@@ -20,6 +21,8 @@ class FrameViewer(QObject):
         super().__init__()
         self.frame: Optional[np.ndarray] = None
         self.received_frame_count = 0
+        # Fixes no image display bug
+        cv.namedWindow("RpiCam")
 
     def on_receive_frame(self, frame: np.ndarray):
         self.frame = cv.cvtColor(frame, cv.COLOR_RGB2BGR)
@@ -36,7 +39,7 @@ class FrameViewer(QObject):
 class RPiCameraGrabber(QObject):
     send_frame = pyqtSignal(np.ndarray)
     close_window = pyqtSignal()
-    pipeline_freed = pyqtSignal()
+    all_work_is_done = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -59,18 +62,18 @@ class RPiCameraGrabber(QObject):
         self.appsink_sample: Optional[Gst.Sample] = None
         self.buffer: Optional[Gst.Buffer] = None
 
-        self.width = 1024
-        self.height = 768
+        self.width = 1536
+        self.height = 864
         self.pixel_format = "RGB"
         self.fps = 30
 
         self.fv = FrameViewer()
-        self.fv_t = QThread(self)
+        self.fv_t = QThread()
         self.fv_t.start()
         self.fv.moveToThread(self.fv_t)
-        self.send_frame.connect(self.fv.on_receive_frame, Qt.QueuedConnection)
-        self.close_window.connect(self.fv.on_close_window, Qt.QueuedConnection)
-        self.fv.window_closed.connect(self.on_window_closed, Qt.QueuedConnection)
+        self.send_frame.connect(self.fv.on_receive_frame, Qt.ConnectionType.QueuedConnection)
+        self.close_window.connect(self.fv.on_close_window, Qt.ConnectionType.QueuedConnection)
+        self.fv.window_closed.connect(self.on_window_closed, Qt.ConnectionType.QueuedConnection)
 
         self.retrieved_frame_count = 0
         self.frame_num = 100
@@ -82,18 +85,18 @@ class RPiCameraGrabber(QObject):
     def gst_deinit(self):
         self.fv_t.quit()
         self.fv_t.wait()
-
         self.loop.quit()
         if self.loop_thread is not None:
             self.loop_thread.join()
         Gst.deinit()
+        print("All work is done. Bye!")
+        self.all_work_is_done.emit()
 
     def initialize(self):
         self.gst_init()
         self.initialize_pipeline()
 
     def initialize_pipeline(self):
-        self.gst_init()
 
         self.pipeline = Gst.Pipeline.new("pipeline")
         self.grouping_bin = Gst.Bin.new("grouping_bin")
@@ -106,6 +109,7 @@ class RPiCameraGrabber(QObject):
         # libcamerasrc
         self.camerasrc = Gst.ElementFactory.make('libcamerasrc', "src_libcamerasrc")
         self.camerasrc.set_state(Gst.State.READY)
+        self.camerasrc.set_property("af-mode", 2)
 
         self.camera_src_pad = self.camerasrc.get_static_pad("src")
         self.camerasrc_src_pad_probe_id = self.camera_src_pad.add_probe(Gst.PadProbeType.BUFFER,
@@ -114,10 +118,10 @@ class RPiCameraGrabber(QObject):
         # tcambin_caps
         self.camerasrc_caps = Gst.Caps.new_empty()
         self.camerasrc_caps = Gst.Caps.from_string(f"{caps_stream_type}, "
-                                                      f"width={self.width}, "
-                                                      f"height={self.height}, "
-                                                      f"format={self.pixel_format}, "
-                                                      f"framerate={self.fps}/1")
+                                                   f"width={self.width}, "
+                                                   f"height={self.height}, "
+                                                   f"format={self.pixel_format}, "
+                                                   f"framerate={self.fps}/1")
         # queue
         self.queue = Gst.ElementFactory.make('queue', "src_queue")
 
@@ -195,13 +199,14 @@ class RPiCameraGrabber(QObject):
         appsink_frame_height = appsink_caps.get_structure(0).get_value('height')
         appsink_frame_width = appsink_caps.get_structure(0).get_value('width')
         appsink_frame_channels = int(self.buffer.get_size() /
-                                              (appsink_frame_height * appsink_frame_width))
+                                     (appsink_frame_height * appsink_frame_width))
         appsink_frame_stream_format = appsink_caps.get_structure(0).get_value('format')
         appsink_frame_data = self.buffer.extract_dup(0, self.buffer.get_size())
 
         if appsink_frame_data:
             frame_image = np.frombuffer(appsink_frame_data, np.uint8).reshape(
                 (appsink_frame_height, appsink_frame_width, appsink_frame_channels))
+            print(f"retrieve_frame: {frame_image.shape}, frame count: {self.retrieved_frame_count}")
             self.send_frame.emit(frame_image)
 
     def on_src_retrieve_frame(self, appsink: Gst.Element):
@@ -218,16 +223,19 @@ class RPiCameraGrabber(QObject):
             return Gst.FlowReturn.OK
 
     def on_window_closed(self):
+        self.pipeline.set_state(Gst.State.NULL)
         self.gst_deinit()
 
 
 def main():
     app = QApplication(sys.argv)
+    # QFontDatabase.addApplicationFont(":/usr/share/fonts/truetype/dejavu")
 
     rpcg = RPiCameraGrabber()
     rpcg.initialize()
+    rpcg.all_work_is_done.connect(app.quit)
     rpcg.start_grabbing()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 
 if __name__ == '__main__':
